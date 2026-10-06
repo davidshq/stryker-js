@@ -22,6 +22,8 @@ import {
 import { TestDefinition } from 'mutation-testing-report-schema';
 import { commonTokens } from '@stryker-mutator/api/plugin';
 
+import { coreTokens } from '../di/index.js';
+
 import {
   DiffChange,
   DiffStatisticsCollector,
@@ -67,11 +69,13 @@ export class IncrementalDiffer {
     commonTokens.logger,
     commonTokens.options,
     commonTokens.fileDescriptions,
+    coreTokens.excludedTestIds,
   ] as const;
   constructor(
     private readonly logger: Logger,
     private readonly options: StrykerOptions,
     fileDescriptions: FileDescriptions,
+    private readonly excludedTestIds: readonly string[],
   ) {
     this.mutateDescriptionByRelativeFileName = new Map(
       Object.entries(fileDescriptions).map(([name, description]) => [
@@ -161,6 +165,8 @@ export class IncrementalDiffer {
         testCoverage.addTest(test);
       }
     }
+
+    const { excludedTestIds } = this;
 
     // Done with preparations, time to map over the mutants
     let reusedMutantCount = 0;
@@ -402,7 +408,9 @@ export class IncrementalDiffer {
         // This is the best we can do when the test runner didn't report coverage.
         // We assume that all mutant test results can be reused,
         // End users can use --force to force retesting of certain mutants
-        return true;
+        // The exception is a kill that may have come from a test that is now excluded
+        // (ignoreFailedTestsInDryRun). Without coverage there is no telling, so retest it.
+        return !(excludedTestIds.length > 0 && oldMutant.status === 'Killed');
       }
       if (oldMutant.status === 'Ignored') {
         // Was previously ignored, but not anymore, we need to run it now
