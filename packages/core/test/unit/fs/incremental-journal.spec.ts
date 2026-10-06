@@ -380,6 +380,29 @@ describe(IncrementalJournal.name, () => {
     );
   });
 
+  it('should not let a pending journal shadow the committed report when removing base.json fails', async () => {
+    await sut.begin(createBase());
+    sut.append(journalMutant({ id: 'run-1' }));
+    const rm = fsNode.promises.rm as (...args: unknown[]) => Promise<void>;
+    // A locked `base.json` (e.g. Windows) can't be removed, so the pending dir stays complete
+    sinon
+      .stub(fsNode.promises, 'rm')
+      .callsFake((target: fsNode.PathLike, ...args: unknown[]) => {
+        if (path.resolve(String(target)).startsWith(path.resolve(pendingDir))) {
+          return Promise.reject(
+            Object.assign(new Error('EBUSY'), { code: 'EBUSY' }),
+          );
+        }
+        return rm(target, ...args);
+      });
+
+    await sut.complete(createBase());
+
+    expect(await fileExists(path.join(pendingDir, INCREMENTAL_PENDING_BASE)))
+      .true;
+    expect(await createSut().load()).undefined;
+  });
+
   it('should map incrementalFile to a gitignore glob covering only the WAL siblings', () => {
     expect(incrementalGitignorePattern('reports/stryker-incremental.json')).eq(
       'reports/stryker-incremental.json.*',

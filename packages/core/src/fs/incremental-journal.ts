@@ -19,6 +19,11 @@ export interface IncrementalJournalMutant extends schema.MutantResult {
 
 export const INCREMENTAL_PENDING_BASE = 'base.json';
 export const INCREMENTAL_PENDING_RESULTS = 'results.jsonl';
+/**
+ * Marks a pending dir as superseded by the committed report. Cleanup of the dir is best-effort
+ * (a locked file can't be removed), so `load()` must not rely on it being gone.
+ */
+export const INCREMENTAL_PENDING_COMPLETED = 'completed';
 
 /**
  * Directory next to `incrementalFile` that holds the in-progress write-ahead log.
@@ -262,11 +267,15 @@ export class IncrementalJournal {
     this.isStarted = false;
     this.walPreserveDir = undefined;
     await this.writeCommittedReport(finalReport);
+    const dirs = [this.pendingDir, this.pendingNextDir, this.pendingPrevDir];
+    // Writing a marker still works when a locked file can't be removed, unlike the cleanup below.
+    for (const dir of dirs) {
+      await this.markCompleted(dir);
+    }
     // Unlink every `base.json` before removing the directories. `load()` only needs
     // `base.json` to recover a pending dir, so a recursive remove that is cut short
     // after deleting `results.jsonl` would otherwise leave a base-only journal that
     // shadows the report that was just committed.
-    const dirs = [this.pendingDir, this.pendingNextDir, this.pendingPrevDir];
     for (const dir of dirs) {
       await this.removeBestEffort(path.join(dir, INCREMENTAL_PENDING_BASE));
     }
@@ -378,6 +387,21 @@ export class IncrementalJournal {
     }
   }
 
+  private async markCompleted(dir: string): Promise<void> {
+    try {
+      await fs.writeFile(path.join(dir, INCREMENTAL_PENDING_COMPLETED), '');
+    } catch (error) {
+      // No pending dir to mark is the normal case for `.next` / `.prev`
+      if (!isNoSuchFileOrDirectory(error)) {
+        this.log.warn(
+          'Failed to mark the incremental journal at "%s" as completed: %s',
+          dir,
+          error,
+        );
+      }
+    }
+  }
+
   private async writeCommittedReport(
     report: schema.MutationTestResult,
   ): Promise<void> {
@@ -394,6 +418,13 @@ export class IncrementalJournal {
   private async loadFromPendingDir(
     dir: string,
   ): Promise<schema.MutationTestResult | undefined> {
+    if (await fileExists(path.join(dir, INCREMENTAL_PENDING_COMPLETED))) {
+      this.log.debug(
+        'Ignoring the incremental journal at "%s": its run completed.',
+        dir,
+      );
+      return;
+    }
     const basePath = path.join(dir, INCREMENTAL_PENDING_BASE);
     let baseRaw: string;
     try {
@@ -499,6 +530,18 @@ async function replaceFile(from: string, to: string): Promise<void> {
       await fs.rm(to, { force: true });
       await fs.rename(from, to);
       return;
+    }
+    throw error;
+  }
+}
+
+async function fileExists(file: string): Promise<boolean> {
+  try {
+    await fs.stat(file);
+    return true;
+  } catch (error) {
+    if (isNoSuchFileOrDirectory(error)) {
+      return false;
     }
     throw error;
   }
