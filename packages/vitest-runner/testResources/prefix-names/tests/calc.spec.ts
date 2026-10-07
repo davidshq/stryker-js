@@ -9,4 +9,9 @@ describe('calc', () => {
   it('add negative', () => {
     expect(1 + -1).toBe(100);
   });
+
+  // Vitest trims the name in the test id, but not in the full name that is matched
+  it('padded ', () => {
+    expect(1 + 1).toBe(2);
+  });
 });

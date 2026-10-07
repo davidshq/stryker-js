@@ -55,6 +55,20 @@ describe('VitestRunner integration', () => {
       assertions.expectSurvived(runResult);
       expect(runResult.nrOfTests).eq(1);
     });
+
+    it('should select a test whose name has trailing whitespace', async () => {
+      await sut.init();
+      const runResult = await sut.mutantRun(
+        factory.mutantRunOptions({
+          activeMutant: factory.mutant({ id: '1' }),
+          sandboxFileName: path.resolve(sandbox.tmpDir, 'math.ts'),
+          mutantActivation: 'runtime',
+          testFilter: ['tests/calc.spec.ts#calc padded'],
+        }),
+      );
+      assertions.expectSurvived(runResult);
+      expect(runResult.nrOfTests).eq(1);
+    });
   });
 
   describe('using the simple-project project', () => {

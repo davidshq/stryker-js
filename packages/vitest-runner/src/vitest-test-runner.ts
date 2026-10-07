@@ -233,12 +233,12 @@ export class VitestTestRunner implements TestRunner {
       const parsedTests = testIds.map(fromTestId);
       // Anchor the end of the pattern: it is matched against the full test name, so without it
       // a filter for "calc add" would also select "calc add negative". The start can't be anchored,
-      // as vitest prefixes the name.
+      // as vitest prefixes the name. Allow trailing whitespace: test ids have it trimmed, the full name doesn't.
       // Vitest < 5 joins nested names with a space, vitest 5+ with " > ". Our test ids always use a space, so accept both.
       const regexTestNameFilter = parsedTests
         .map(({ test: name }) => escapeRegExp(name).replace(/ /g, '(?: > | )'))
         .join('|');
-      const regex = new RegExp(`(?:${regexTestNameFilter})$`);
+      const regex = new RegExp(`(?:${regexTestNameFilter})\\s*$`);
       testFilesToRun = parsedTests.map(({ file }) => file);
       this.ctx!.projects.forEach((project) => {
         project.config.testNamePattern = regex;
