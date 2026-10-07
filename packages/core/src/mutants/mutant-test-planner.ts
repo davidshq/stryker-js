@@ -1,6 +1,6 @@
 import path from 'path';
 
-import { TestResult } from '@stryker-mutator/api/test-runner';
+import { MutantActivation, TestResult } from '@stryker-mutator/api/test-runner';
 import {
   MutantRunPlan,
   MutantTestPlan,
@@ -48,11 +48,12 @@ export class MutantTestPlanner {
     coreTokens.sandbox,
     coreTokens.project,
     coreTokens.timeOverheadMS,
+    coreTokens.excludedTestIds,
     commonTokens.options,
     commonTokens.logger,
   );
   private readonly timeSpentAllTests: number;
-  private readonly globalTestFilter: string[] | undefined;
+  private readonly allTestIds: string[] | undefined;
 
   constructor(
     private readonly testCoverage: I<TestCoverage>,
@@ -61,17 +62,21 @@ export class MutantTestPlanner {
     private readonly sandbox: I<Sandbox>,
     private readonly project: I<Project>,
     private readonly timeOverheadMS: number,
+    excludedTestIds: readonly string[],
     private readonly options: StrykerOptions,
     private readonly logger: Logger,
   ) {
     this.timeSpentAllTests = calculateTotalTime(
       this.testCoverage.testsById.values(),
     );
-    this.globalTestFilter =
-      this.project.testFiles.length > 0
-        ? this.project.testFiles.map((file) =>
-            this.sandbox.sandboxFileFor(file),
-          )
+    // When the dry run only ran part of the test suite, "all tests" has to be an explicit list of the tests it ran:
+    // - `testFiles` limited it to some test files
+    // - `ignoreFailedTestsInDryRun` excluded the failed tests afterwards
+    // These are test ids, like any other test filter. Test runners match a filter against test ids (mocha, jest and
+    // jasmine by test name), so passing the test file names instead would run no tests at all.
+    this.allTestIds =
+      this.project.testFiles.length > 0 || excludedTestIds.length > 0
+        ? [...this.testCoverage.testsById.keys()]
         : undefined;
   }
 
@@ -125,16 +130,27 @@ export class MutantTestPlanner {
           netTime: this.timeSpentAllTests,
           isStatic,
           coveredBy,
-          testFilter: this.globalTestFilter,
+          ...this.runAllTestsOptions(),
         });
       }
     } else {
       // No coverage information exists, all tests need to run
       return this.createMutantRunPlan(mutant, {
         netTime: this.timeSpentAllTests,
-        testFilter: this.globalTestFilter,
+        ...this.runAllTestsOptions(),
       });
     }
+  }
+
+  private runAllTestsOptions(): {
+    testFilter: string[] | undefined;
+    mutantActivation?: MutantActivation;
+  } {
+    if (!this.allTestIds) {
+      return { testFilter: undefined };
+    }
+    // An explicit filter of all tests is still "all tests": keep the static activation that implies
+    return { testFilter: this.allTestIds, mutantActivation: 'static' };
   }
 
   private createMutantEarlyResultPlan(
@@ -173,11 +189,13 @@ export class MutantTestPlanner {
       testFilter,
       isStatic,
       coveredBy,
+      mutantActivation = testFilter ? 'runtime' : 'static',
     }: {
       netTime: number;
       testFilter?: string[] | undefined;
       isStatic?: boolean | undefined;
       coveredBy?: string[] | undefined;
+      mutantActivation?: MutantActivation;
     },
   ): MutantRunPlan {
     const { disableBail, timeoutMS, timeoutFactor } = this.options;
@@ -208,7 +226,7 @@ export class MutantTestPlanner {
           mutatorName: mutant.mutatorName,
           replacement: mutant.replacement,
         },
-        mutantActivation: testFilter ? 'runtime' : 'static',
+        mutantActivation,
         timeout,
         testFilter,
         sandboxFileName: this.sandbox.sandboxFileFor(mutant.fileName),

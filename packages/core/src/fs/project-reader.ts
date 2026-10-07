@@ -15,6 +15,7 @@ import {
   ERROR_CODES,
   I,
   isErrnoException,
+  normalizeFileName,
   notEmpty,
 } from '@stryker-mutator/util';
 import type { MutationTestResult } from 'mutation-testing-report-schema/api';
@@ -26,6 +27,10 @@ import { coreTokens } from '../di/index.js';
 
 import { Project } from './project.js';
 import { FileSystem } from './file-system.js';
+import {
+  IncrementalJournal,
+  incrementalIgnorePaths,
+} from './incremental-journal.js';
 
 const ALWAYS_IGNORE = Object.freeze([
   'node_modules',
@@ -60,6 +65,7 @@ export class ProjectReader {
     coreTokens.fs,
     commonTokens.logger,
     commonTokens.options,
+    coreTokens.incrementalJournal,
   );
   constructor(
     private readonly fs: I<FileSystem>,
@@ -75,15 +81,26 @@ export class ProjectReader {
       jsonReporter,
       testFiles,
     }: StrykerOptions,
+    private readonly incrementalJournal: I<IncrementalJournal>,
   ) {
     this.mutatePatterns = mutate;
     this.testFilePatterns = testFiles ?? [];
     this.ignoreRules = [
       ...ALWAYS_IGNORE,
-      tempDirName,
-      incrementalFile,
-      htmlReporter.fileName,
-      jsonReporter.fileName,
+      // These options are paths, but they end up here as minimatch patterns, where a
+      // backslash is an escape rather than a separator. Minimatch normalizes the paths it
+      // matches against, not the patterns, so `path.join('reports', 'foo.json')` on Windows
+      // would silently match nothing. The same goes for a leading `./` or an absolute path:
+      // minimatch matches against cwd-relative names, so those are made cwd-relative too.
+      // `ignorePatterns` is left alone on purpose: those are user-authored globs, where the
+      // escape is meaningful.
+      ...[
+        tempDirName,
+        incrementalFile,
+        ...incrementalIgnorePaths(incrementalFile),
+        htmlReporter.fileName,
+        jsonReporter.fileName,
+      ].map(toIgnorePattern),
       ...ignorePatterns,
     ];
     this.incremental = incremental;
@@ -415,41 +432,19 @@ export class ProjectReader {
     if (!this.incremental) {
       return;
     }
+    const report =
+      (await this.incrementalJournal.load()) ??
+      (await this.readCommittedIncrementalFile());
+    return report && this.remapReportLocations(report);
+  }
+
+  private async readCommittedIncrementalFile(): Promise<
+    MutationTestResult | undefined
+  > {
     try {
       // TODO: Validate against the schema or stryker version?
       const contents = await this.fs.readFile(this.incrementalFile, 'utf-8');
-      const result: MutationTestResult = JSON.parse(contents);
-      return {
-        ...result,
-        files: Object.fromEntries(
-          Object.entries(result.files).map(([fileName, file]) => [
-            fileName,
-            {
-              ...file,
-              mutants: file.mutants.map((mutant) => ({
-                ...mutant,
-                location: reportLocationToStrykerLocation(mutant.location),
-              })),
-            },
-          ]),
-        ),
-        testFiles:
-          result.testFiles &&
-          Object.fromEntries(
-            Object.entries(result.testFiles).map(([fileName, file]) => [
-              fileName,
-              {
-                ...file,
-                tests: file.tests.map((test) => ({
-                  ...test,
-                  location:
-                    test.location &&
-                    reportOpenEndLocationToStrykerLocation(test.location),
-                })),
-              },
-            ]),
-          ),
-      };
+      return JSON.parse(contents) as MutationTestResult;
     } catch (err: unknown) {
       if (
         isErrnoException(err) &&
@@ -464,6 +459,43 @@ export class ProjectReader {
       // Whoops, didn't mean to catch this one!
       throw err;
     }
+  }
+
+  /**
+   * Report schema locations are 1-based; Stryker works 0-based internally.
+   */
+  private remapReportLocations(result: MutationTestResult): MutationTestResult {
+    return {
+      ...result,
+      files: Object.fromEntries(
+        Object.entries(result.files).map(([fileName, file]) => [
+          fileName,
+          {
+            ...file,
+            mutants: file.mutants.map((mutant) => ({
+              ...mutant,
+              location: reportLocationToStrykerLocation(mutant.location),
+            })),
+          },
+        ]),
+      ),
+      testFiles:
+        result.testFiles &&
+        Object.fromEntries(
+          Object.entries(result.testFiles).map(([fileName, file]) => [
+            fileName,
+            {
+              ...file,
+              tests: file.tests.map((test) => ({
+                ...test,
+                location:
+                  test.location &&
+                  reportOpenEndLocationToStrykerLocation(test.location),
+              })),
+            },
+          ]),
+        ),
+    };
   }
 }
 
@@ -490,4 +522,16 @@ function reportPositionToStrykerPosition({ line, column }: Position): Position {
     line: line - 1,
     column: column - 1,
   };
+}
+
+/**
+ * Turns a configured path into an ignore pattern that matches the cwd-relative file names
+ * the reader sees. `./reports/foo.json` and `/abs/cwd/reports/foo.json` both become `reports/foo.json`.
+ */
+function toIgnorePattern(configuredPath: string): string {
+  const normalized = normalizeFileName(configuredPath);
+  const relative = normalizeFileName(
+    path.relative(process.cwd(), path.resolve(normalized)),
+  );
+  return relative || normalized;
 }

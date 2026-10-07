@@ -203,6 +203,8 @@ Config file: `"disableBail": true`
 
 Configure the test runner to report all failing tests when a mutant is killed instead of bailing after the first failing test. Bailing brings better performance, but you might be interested in the full report instead. This might be useful when using the "Tests" view to hunt for tests that don't kill a single mutant.
 
+The initial test run never bails when [`ignoreFailedTestsInDryRun`](#ignorefailedtestsindryrun-boolean) is enabled, whatever this option says.
+
 See the difference of bail vs no bail on StrykerJS's utils package (with `--concurrency 4`):
 
 | With bail (in 2m 33s)                              | Disable bail (in 2 m 45s)                                |
@@ -289,6 +291,22 @@ The options for the html reporter:
 
 - `fileName`: The relative `fileName` of the html report.
 
+### `ignoreFailedTestsInDryRun` [`boolean`]
+
+Default: `false`<br />
+Command: `--ignoreFailedTestsInDryRun`<br />
+Config file: `"ignoreFailedTestsInDryRun": true`
+
+By default, Stryker exits with `There were failed tests in the initial test run.` when any test fails during the initial test run (dry run), because a failing test would make every mutant it runs against look killed. With this option enabled, Stryker logs the failed tests as a warning and continues without them:
+
+- The failed tests are never run against a mutant, so they can't kill one. When coverage analysis is `"off"`, or for a static mutant, Stryker runs every remaining test instead of every test.
+- With `"perTest"` coverage analysis, mutants that are only covered by failed tests are reported as `NoCoverage`. With `"all"` or `"off"`, Stryker has no per-test coverage to go on, so those mutants run against the remaining tests and will likely be reported as `Survived`.
+- Tests are excluded by id. A failure in a mocha `after` (`after all`) hook is reported under the id of the test that ran last before the hook, so only that test is excluded; the hook still fails, and still kills mutants, whenever the other tests of that suite run. Fix failing hooks rather than relying on this option.
+- The initial test run ignores `disableBail` and runs the whole suite. Otherwise a runner that stops at the first failure would leave the tests after it out of the run, and those would be dropped along with the failed ones.
+- If every test fails, Stryker still exits with an error.
+
+The dry run still runs, so the sandbox is still validated and coverage is still collected. This is meant for local runs, for example resuming an interrupted [incremental](./incremental.md) run while an unrelated test is broken. Don't use it in CI: the mutation score no longer reflects your full test suite.
+
 ### `ignorePatterns` [`string[]`]
 
 Default: `[]`<br />
@@ -297,7 +315,7 @@ Config file: `"ignorePatterns": ["dist", "coverage"]`<br />
 
 Specify the patterns to all files or directories that are not used to run your tests and thus should _not be copied_ to the sandbox directory for mutation testing. Each patterns in this array should be a [glob pattern](#usage-of-globbing-expressions-on-options).
 
-These patterns are **always ignored**: `['node_modules', '.git', '*.tsbuildinfo', '/stryker.log']`. The configured files in the `tempDirName`,`incrementalFile`, `htmlReporter.fileName` and `jsonReporter.fileName` options are also ignored.
+These patterns are **always ignored**: `['node_modules', '.git', '*.tsbuildinfo', '/stryker.log']`. The configured files in the `tempDirName`, `incrementalFile`, `htmlReporter.fileName` and `jsonReporter.fileName` options are also ignored, along with the pending directory and temporary files next to `incrementalFile` (for example `reports/stryker-incremental.json.pending/`).
 Because Stryker always ignores these, you should rarely have to adjust the `"ignorePatterns"` setting at all. If you want to undo one of these ignore patterns, you can use the `!` prefix, for example: `["!node_modules"]`.
 
 Overriding `--ignorePatterns` is only needed when you experience a slow Stryker startup, because too many (or too large) files are copied to the sandbox that are not needed to run the tests.
@@ -374,6 +392,8 @@ Config file: `"incrementalFile": "reports/stryker-incremental-alternative.json"`
 Specify the file to use for incremental mode.
 See [incremental](./incremental.md) for more details.
 
+While a run is in progress, StrykerJS also writes sibling files and directories next to the report, such as the `.pending/` directory (for example `reports/stryker-incremental.json.pending/`). Gitignore them. `stryker init` adds `reports/stryker-incremental.json.*` to `.gitignore`, which covers the pending directories and the temp file but not the incremental report itself.
+
 ### `inPlace` [`boolean`]
 
 Default: `false`<br />
@@ -383,7 +403,7 @@ Config file: `"inPlace": true`<br />
 Determines whether Stryker should mutate your files in place.
 Note: mutating your files in place is generally not needed for mutation testing, unless you have a dependency in your project that is really dependent on the file locations (like "app-root-path" for example).
 
-When `true`, Stryker will override your files, but it will keep a copy of the originals in the temp directory (using `tempDirName`) and it will place the originals back after it is done. Also, with `true` the [`ignorePatterns`](#ignorepatterns-string) has no effect anymore.
+When `true`, Stryker will override your files, but it will keep a copy of the originals in the temp directory (using `tempDirName`) and it will place the originals back after it is done (including on most unexpected exits, such as Ctrl+C or a crash, but not a hard kill). Also, with `true` the [`ignorePatterns`](#ignorepatterns-string) has no effect anymore.
 
 When `false` (default) Stryker will work in the copy of your code inside the temp directory.
 

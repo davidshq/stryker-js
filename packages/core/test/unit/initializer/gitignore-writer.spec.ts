@@ -10,6 +10,7 @@ import { GitignoreWriter } from '../../../src/initializer/gitignore-writer.js';
 import { initializerTokens } from '../../../src/initializer/index.js';
 
 const GITIGNORE_FILE = '.gitignore';
+const STRYKER_GITIGNORE = `${os.EOL}# stryker${os.EOL}.stryker-tmp${os.EOL}reports/stryker-incremental.json.*${os.EOL}`;
 
 describe(GitignoreWriter.name, () => {
   let sut: GitignoreWriter;
@@ -51,7 +52,7 @@ describe(GitignoreWriter.name, () => {
         // Assert
         expect(fsAppendFile).calledWithExactly(
           GITIGNORE_FILE,
-          `${os.EOL}# stryker temp files${os.EOL}.stryker-tmp${os.EOL}`,
+          STRYKER_GITIGNORE,
         );
       });
 
@@ -70,12 +71,72 @@ describe(GitignoreWriter.name, () => {
 
       it("should not append the stryker gitignore configuration if it's already present", async () => {
         // Arrange
-        fsReadFile.returns(`node_modules${os.EOL}.stryker-tmp${os.EOL}temp`);
+        fsReadFile.returns(
+          `node_modules${os.EOL}.stryker-tmp${os.EOL}reports/stryker-incremental.json.*${os.EOL}temp`,
+        );
 
         // Act
         await sut.addStrykerTempFolder();
 
         // Assert
+        expect(fsAppendFile).not.called;
+      });
+
+      it('should append only the incremental glob when the temp dir is already ignored', async () => {
+        // Arrange
+        fsReadFile.returns(`node_modules${os.EOL}.stryker-tmp${os.EOL}`);
+
+        // Act
+        await sut.addStrykerTempFolder();
+
+        // Assert
+        expect(fsAppendFile).calledWithExactly(
+          GITIGNORE_FILE,
+          `${os.EOL}reports/stryker-incremental.json.*${os.EOL}`,
+        );
+      });
+    });
+
+    describe('with existing entries that only resemble the patterns', () => {
+      beforeEach(() => {
+        fsExistsSync.returns(true);
+      });
+
+      it('should not count a commented-out pattern as present', async () => {
+        fsReadFile.returns(
+          `# .stryker-tmp${os.EOL}# reports/stryker-incremental.json.*${os.EOL}`,
+        );
+        await sut.addStrykerTempFolder();
+        expect(fsAppendFile).calledWithExactly(
+          GITIGNORE_FILE,
+          STRYKER_GITIGNORE,
+        );
+      });
+
+      it('should not count a longer pattern as present', async () => {
+        fsReadFile.returns(
+          `.stryker-tmp-2${os.EOL}reports/stryker-incremental.json.pending/${os.EOL}`,
+        );
+        await sut.addStrykerTempFolder();
+        expect(fsAppendFile).calledWithExactly(
+          GITIGNORE_FILE,
+          STRYKER_GITIGNORE,
+        );
+      });
+
+      it('should count a slash-anchored or directory form as present', async () => {
+        fsReadFile.returns(
+          `/.stryker-tmp/${os.EOL}reports/stryker-incremental.json.*${os.EOL}`,
+        );
+        await sut.addStrykerTempFolder();
+        expect(fsAppendFile).not.called;
+      });
+
+      it('should handle CRLF line endings', async () => {
+        fsReadFile.returns(
+          '.stryker-tmp\r\nreports/stryker-incremental.json.*\r\n',
+        );
+        await sut.addStrykerTempFolder();
         expect(fsAppendFile).not.called;
       });
     });
@@ -91,7 +152,7 @@ describe(GitignoreWriter.name, () => {
 
         // Assert
         expect(out).calledWithExactly(
-          'No .gitignore file could be found. Please add the following to your .gitignore file: *.stryker-tmp',
+          'No .gitignore file could be found. Please add the following to your .gitignore file: .stryker-tmp, reports/stryker-incremental.json.*',
         );
       });
     });

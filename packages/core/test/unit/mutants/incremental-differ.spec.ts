@@ -8,6 +8,7 @@ import chalk from 'chalk';
 import sinon from 'sinon';
 
 import { IncrementalDiffer } from '../../../src/mutants/index.js';
+import { coreTokens } from '../../../src/di/index.js';
 import { createMutant, loc, pos } from '../../helpers/producers.js';
 import { TestCoverageTestDouble } from '../../helpers/test-coverage-test-double.js';
 
@@ -107,6 +108,7 @@ class ScenarioBuilder {
   public currentFiles = new Map<string, string>();
   public mutants: Mutant[] = [];
   public testCoverage = new TestCoverageTestDouble();
+  public excludedTestIds: string[] = [];
   public sut?: IncrementalDiffer;
 
   public withMathProjectExample({
@@ -168,6 +170,11 @@ class ScenarioBuilder {
     );
     this.testCoverage.clear();
     this.testCoverage.hasCoverage = false;
+    return this;
+  }
+
+  public withExcludedTest(): this {
+    this.excludedTestIds.push('failed-test');
     return this;
   }
 
@@ -564,7 +571,9 @@ class ScenarioBuilder {
   }
 
   public act() {
-    this.sut = testInjector.injector.injectClass(IncrementalDiffer);
+    this.sut = testInjector.injector
+      .provideValue(coreTokens.excludedTestIds, this.excludedTestIds)
+      .injectClass(IncrementalDiffer);
     deepFreeze(this.mutants); // make sure mutants aren't changed at all
     return this.sut.diff(
       this.mutants,
@@ -794,6 +803,32 @@ describe(IncrementalDiffer.name, () => {
           `\n\tTests:\t\t${testStatisticsCollector!.createTotalsReport()}` +
           `\n\tResult:\t\t${chalk.yellowBright(0)} of 1 mutant result(s) are reused.`,
       );
+    });
+
+    it('should reuse a killed mutant without coverage when no tests were excluded', () => {
+      const actualDiff = new ScenarioBuilder()
+        .withMathProjectExample()
+        .withoutTestCoverage()
+        .act();
+      expect(actualDiff[0].status).eq('Killed');
+    });
+
+    it('should not reuse a killed mutant without coverage when tests were excluded', () => {
+      const actualDiff = new ScenarioBuilder()
+        .withMathProjectExample()
+        .withoutTestCoverage()
+        .withExcludedTest()
+        .act();
+      expect(actualDiff[0].status).undefined;
+    });
+
+    it('should reuse a survived mutant without coverage when tests were excluded', () => {
+      const actualDiff = new ScenarioBuilder()
+        .withMathProjectExample({ mutantState: 'Survived' })
+        .withoutTestCoverage()
+        .withExcludedTest()
+        .act();
+      expect(actualDiff[0].status).eq('Survived');
     });
 
     it('should not log test diff when there is no test coverage', () => {

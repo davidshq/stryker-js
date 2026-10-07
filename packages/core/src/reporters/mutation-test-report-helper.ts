@@ -33,8 +33,13 @@ import {
 
 import { strykerVersion } from '../stryker-package.js';
 import { coreTokens } from '../di/index.js';
+import { fileUtils } from '../utils/file-utils.js';
 import { objectUtils } from '../utils/object-utils.js';
-import { Project, FileSystem } from '../fs/index.js';
+import {
+  IncrementalJournal,
+  IncrementalJournalMutant,
+  Project,
+} from '../fs/index.js';
 import { TestCoverage } from '../mutants/index.js';
 import { UnexpectedExitHandler } from '../unexpected-exit-handler.js';
 
@@ -56,6 +61,30 @@ const STRYKER_FRAMEWORK: Readonly<
 export class MutationTestReportHelper {
   private readonly partialResults: MutantResult[] = [];
   private reportCompleted = false;
+  /**
+   * The in-flight (or settled) `incrementalJournal.complete()`. The exit handler and
+   * `reportAll` can both get here, and two completions would write the same temp file
+   * concurrently. The first one wins; the other waits for it.
+   */
+  private incrementalCompletion: Promise<void> | undefined;
+  /**
+   * Set once `beginIncrementalJournal()` has returned, whether or not the journal
+   * actually started. Before that, compacting could race `begin()`'s directory swap.
+   */
+  private journalBeginSettled = false;
+  /**
+   * File names already warned about, so the same warning isn't repeated when the
+   * report is generated more than once (incremental runs report at plan time as
+   * well as at the end).
+   */
+  private readonly warnedMissingSourceFiles = new Set<string>();
+  private readonly warnedMissingTestFiles = new Set<string>();
+  private testIdRemapper:
+    | {
+        remapTestId: (id: string) => string;
+        remapTestIds: (ids: string[] | undefined) => string[] | undefined;
+      }
+    | undefined;
 
   public static inject = tokens(
     coreTokens.reporter,
@@ -63,9 +92,9 @@ export class MutationTestReportHelper {
     coreTokens.project,
     commonTokens.logger,
     coreTokens.testCoverage,
-    coreTokens.fs,
     coreTokens.requireFromCwd,
     coreTokens.unexpectedExitRegistry,
+    coreTokens.incrementalJournal,
   );
 
   constructor(
@@ -74,18 +103,36 @@ export class MutationTestReportHelper {
     private readonly project: Project,
     private readonly log: Logger,
     private readonly testCoverage: I<TestCoverage>,
-    private readonly fs: I<FileSystem>,
     private readonly requireFromCwd: typeof requireResolve,
     unexpectedExitHandler: I<UnexpectedExitHandler>,
+    private readonly incrementalJournal: I<IncrementalJournal>,
   ) {
     unexpectedExitHandler.registerHandler(async () => {
+      // Only compact once `begin()` has settled. Completing before it would
+      // write a truncated plan-time report and delete a recovered WAL from a
+      // prior crash. Don't require that `begin()` succeeded: if the journal
+      // failed to start, compacting is the only way to keep this run's results.
       if (
         this.options.incremental &&
         !this.reportCompleted &&
+        this.journalBeginSettled &&
         this.partialResults.length > 0
       ) {
-        const report = await this.mutationTestReport(this.partialResults);
-        await this.writeIncrementalReport(report);
+        // Freeze the WAL first. Workers can keep reporting while we await file
+        // reads; if those results were appended and then `complete()` deleted the
+        // pending dir, they would vanish from both the WAL and the compact.
+        this.incrementalJournal.close();
+        // Snapshot so `mutationTestReport` cannot see a new file appear mid-await
+        // (it builds the file map, then walks the array again after those awaits).
+        const report = await this.mutationTestReport([...this.partialResults]);
+        if (this.incrementalCompletion) {
+          // `reportAll` got there while we were reading files and its report is complete.
+          // Wait for it, so the process isn't torn down in the middle of its write.
+          await this.incrementalCompletion;
+          return;
+        }
+        await this.completeIncrementalJournal(report);
+        this.reportCompleted = true;
         this.log.info(
           'Saved a partial incremental report to "%s" after an unexpected interrupt.',
           this.options.incrementalFile,
@@ -162,8 +209,29 @@ export class MutationTestReportHelper {
 
   private reportOne(result: MutantResult): MutantResult {
     this.partialResults.push(result);
+    // `isStarted` implies incremental is enabled and `begin()` committed the pending
+    // pair. Checking it here (rather than only inside `append`) avoids building a
+    // journal mutant for every plan-time result that `append` would then discard.
+    if (this.incrementalJournal.isStarted) {
+      this.incrementalJournal.append(this.toJournalMutant(result));
+    }
     this.reporter.onMutantTested(result);
     return result;
+  }
+
+  /**
+   * Persist plan-time mutant results (reused, ignored) as the incremental
+   * journal's `base.json` before the checkers and test runners run mutants.
+   * Later `reportOne` calls are appended to `results.jsonl`.
+   */
+  public async beginIncrementalJournal(): Promise<void> {
+    if (!this.options.incremental) {
+      return;
+    }
+    const base = await this.mutationTestReport(this.partialResults);
+    await this.includeRemainingMutatedFiles(base);
+    await this.incrementalJournal.begin(base);
+    this.journalBeginSettled = true;
   }
 
   private checkStatusToResultStatus(
@@ -180,23 +248,17 @@ export class MutationTestReportHelper {
     const metrics = calculateMutationTestMetrics(report);
     this.reporter.onMutationTestReportReady(report, metrics);
     if (this.options.incremental) {
-      await this.writeIncrementalReport(report);
+      await this.completeIncrementalJournal(report);
     }
     this.reportCompleted = true;
     this.determineExitCode(metrics);
   }
 
-  private async writeIncrementalReport(
+  private completeIncrementalJournal(
     report: schema.MutationTestResult,
   ): Promise<void> {
-    await this.fs.mkdir(path.dirname(this.options.incrementalFile), {
-      recursive: true,
-    });
-    await this.fs.writeFile(
-      this.options.incrementalFile,
-      JSON.stringify(report, null, 2),
-      'utf-8',
-    );
+    this.incrementalCompletion ??= this.incrementalJournal.complete(report);
+    return this.incrementalCompletion;
   }
 
   private determineExitCode(metrics: MutationTestMetricsResult) {
@@ -227,18 +289,7 @@ export class MutationTestReportHelper {
   private async mutationTestReport(
     results: readonly MutantResult[],
   ): Promise<schema.MutationTestResult> {
-    // Mocha, jest and karma use test titles as test ids.
-    // This can mean a lot of duplicate strings in the json report.
-    // Therefore we remap the test ids here to numbers.
-    const testIdMap = new Map(
-      [...this.testCoverage.testsById.values()].map((test, index) => [
-        test.id,
-        index.toString(),
-      ]),
-    );
-    const remapTestId = (id: string): string => testIdMap.get(id) ?? id;
-    const remapTestIds = (ids: string[] | undefined): string[] | undefined =>
-      ids?.map(remapTestId);
+    const { remapTestId, remapTestIds } = this.getTestIdRemapper();
 
     return {
       files: await this.toFileResults(results, remapTestIds),
@@ -251,6 +302,56 @@ export class MutationTestReportHelper {
         ...STRYKER_FRAMEWORK,
         dependencies: this.discoverDependencies(),
       },
+    };
+  }
+
+  /**
+   * Mocha, jest and karma use test titles as test ids.
+   * This can mean a lot of duplicate strings in the json report.
+   * Therefore we remap the test ids here to numbers.
+   * The same mapping is reused for journal JSONL lines so they share one namespace with `base.json`.
+   */
+  private getTestIdRemapper(): {
+    remapTestId: (id: string) => string;
+    remapTestIds: (ids: string[] | undefined) => string[] | undefined;
+  } {
+    if (!this.testIdRemapper) {
+      const testIdMap = new Map(
+        [...this.testCoverage.testsById.values()].map((test, index) => [
+          test.id,
+          index.toString(),
+        ]),
+      );
+      const remapTestId = (id: string): string => testIdMap.get(id) ?? id;
+      const remapTestIds = (ids: string[] | undefined): string[] | undefined =>
+        ids?.map(remapTestId);
+      this.testIdRemapper = { remapTestId, remapTestIds };
+    }
+    return this.testIdRemapper;
+  }
+
+  /**
+   * `mutationTestReport` only emits files that already have results. The journal
+   * base must also include sources for files whose mutants will be written to JSONL.
+   */
+  private async includeRemainingMutatedFiles(
+    report: schema.MutationTestResult,
+  ): Promise<void> {
+    await Promise.all(
+      [...this.project.filesToMutate].map(async ([fileName]) => {
+        const reportFileName = normalizeReportFileName(fileName);
+        if (!report.files[reportFileName]) {
+          report.files[reportFileName] = await this.toFileResult(fileName);
+        }
+      }),
+    );
+  }
+
+  private toJournalMutant(result: MutantResult): IncrementalJournalMutant {
+    const { remapTestIds } = this.getTestIdRemapper();
+    return {
+      fileName: normalizeReportFileName(result.fileName),
+      ...this.toMutantResult(result, remapTestIds),
     };
   }
 
@@ -313,14 +414,15 @@ export class MutationTestReportHelper {
 
   private async toFileResult(fileName: string): Promise<schema.FileResult> {
     const fileResult: schema.FileResult = {
-      language: this.determineLanguage(fileName),
+      language: fileUtils.determineLanguage(fileName),
       mutants: [],
       source: '',
     };
     const sourceFile = this.project.files.get(fileName);
     if (sourceFile) {
       fileResult.source = await sourceFile.readOriginal();
-    } else {
+    } else if (!this.warnedMissingSourceFiles.has(fileName)) {
+      this.warnedMissingSourceFiles.add(fileName);
       this.log.warn(
         normalizeWhitespaces(`File "${fileName}" not found
     in input files, but did receive mutant result for it. This shouldn't happen`),
@@ -337,7 +439,8 @@ export class MutationTestReportHelper {
       const file = this.project.files.get(fileName);
       if (file) {
         testFile.source = await file.readOriginal();
-      } else {
+      } else if (!this.warnedMissingTestFiles.has(fileName)) {
+        this.warnedMissingTestFiles.add(fileName);
         this.log.warn(
           normalizeWhitespaces(`Test file "${fileName}" not found
         in input files, but did receive test result for it. This shouldn't happen.`),
@@ -358,20 +461,6 @@ export class MutationTestReportHelper {
         ? { start: objectUtils.toSchemaPosition(test.startPosition) }
         : undefined,
     };
-  }
-
-  private determineLanguage(name: string): string {
-    const ext = path.extname(name).toLowerCase();
-    switch (ext) {
-      case '.ts':
-      case '.tsx':
-        return 'typescript';
-      case '.html':
-      case '.vue':
-        return 'html';
-      default:
-        return 'javascript';
-    }
   }
 
   private toMutantResult(
